@@ -1,0 +1,10 @@
+requests
+logging
+telnyx
+boto3
+flask
+gunicorn
+werkzeug
+dotenv
+celery
+redis
