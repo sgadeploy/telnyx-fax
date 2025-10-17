@@ -207,7 +207,6 @@ def send_fax_task(self, file_path, file_name, to_number, from_number, connection
 def send_email_task(self, attachment, from_number, to_number, email):
     try:
         email_response = send_email(attachment, from_number, to_number, email)
-
         if email_response.status_code == 200:
             try:
                 response_json = email_response.json()
@@ -216,9 +215,7 @@ def send_email_task(self, attachment, from_number, to_number, email):
                 logger.error(f"Failed to decode JSON. Raw response: {email_response.text}")
         else:
             logger.error(f"Email API returned status {email_response.status_code}: {email_response.text}")
-
         return email_response.text
-
     except Exception as exc:
         logger.error("Error sending email", exc_info=True)
         raise self.retry(exc=exc, countdown=300)
