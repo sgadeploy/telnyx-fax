@@ -41,9 +41,7 @@ def get_fax_file(fax_id):
 def delete_fax_file(fax_id):
     redis_client.delete(fax_id)
 
-####NEW####
 def set_fax_meta(fax_id, meta_dict, ttl_seconds=7*24*3600):
-    # Store as JSON; keep a TTL so Redis doesn't grow forever
     redis_client.set(f"fax_meta:{fax_id}", json.dumps(meta_dict), ex=ttl_seconds)
 
 def get_fax_meta(fax_id):
@@ -61,7 +59,6 @@ def mark_fax_notified_once(fax_id, ttl_seconds=7*24*3600):
     key = f"fax_notified:{fax_id}"
     # SET key value NX EX ttl
     return bool(redis_client.set(key, "1", nx=True, ex=ttl_seconds))
-####END-NEW####
 
 # --- Initialisation du module Celery ---
 celery = Celery(
