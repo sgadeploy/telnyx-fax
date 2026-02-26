@@ -1,4 +1,4 @@
-#################################################### 
+####################################################
 #--- Importation des modules ---
 ####################################################
 import re
@@ -19,7 +19,7 @@ from werkzeug.utils import secure_filename
 from dotenv import load_dotenv, find_dotenv
 from celery import Celery
 
-#################################################### 
+####################################################
 #--- Fonction d'initialisation ---
 ####################################################
 
@@ -40,6 +40,28 @@ def get_fax_file(fax_id):
 
 def delete_fax_file(fax_id):
     redis_client.delete(fax_id)
+
+####NEW####
+def set_fax_meta(fax_id, meta_dict, ttl_seconds=7*24*3600):
+    # Store as JSON; keep a TTL so Redis doesn't grow forever
+    redis_client.set(f"fax_meta:{fax_id}", json.dumps(meta_dict), ex=ttl_seconds)
+
+def get_fax_meta(fax_id):
+    raw = redis_client.get(f"fax_meta:{fax_id}")
+    return json.loads(raw.decode()) if raw else None
+
+def delete_fax_meta(fax_id):
+    redis_client.delete(f"fax_meta:{fax_id}")
+
+def mark_fax_notified_once(fax_id, ttl_seconds=7*24*3600):
+    """
+    Returns True only the first time it's called for a fax_id.
+    Prevents duplicate emails when Telnyx retries webhooks. [1](https://support.telnyx.com/en/articles/4394516-configuring-programmable-fax-applications)
+    """
+    key = f"fax_notified:{fax_id}"
+    # SET key value NX EX ttl
+    return bool(redis_client.set(key, "1", nx=True, ex=ttl_seconds))
+####END-NEW####
 
 # --- Initialisation du module Celery ---
 celery = Celery(
@@ -90,7 +112,7 @@ def get_bucket_name() -> str:
         raise RuntimeError("TELNYX_S3_BUCKET is required")
     return name
 
-#################################################### 
+####################################################
 #--- Fonctions complementaires ---
 ####################################################
 
@@ -178,12 +200,48 @@ def send_email(file_name: str, from_phone_number: str, to_phone_number: str, ema
     )
     return email_result
 
-#################################################### 
+# --- Confirmation par courriel de la transmission du fax ---
+def send_delivery_notification_email(notify_email: str, fax_id: str, to_number: str, from_number: str, file_name: str = None):
+    auth = ("api", MAILGUN_API_KEY)
+    email_uri = f"https://api.mailgun.net/v3/{MAILGUN_DOMAIN}/messages"
+
+    subject = "Confirmation de transmission de fax"
+    text_lines = [
+        "Bonjour,",
+        "",
+        "Votre fax a été transmis avec succès.",
+        "",
+        "Détails de la transmission:",
+        "",
+        f" - Fax ID: {fax_id}",
+        f" - De: {from_number}",
+        f" - Vers: {to_number}",
+        f" - Fichier: {file_name}",
+        "",
+        "",
+        "Merci et bonne journée",
+    ]
+#    if file_name:
+#        text_lines.append(f" - Fichier: {file_name}")
+
+    return requests.post(
+        email_uri,
+        auth=auth,
+        data={
+            "from": f"Service de fax <fax@{MAILGUN_DOMAIN}>",
+            "to": notify_email,
+            "subject": subject,
+            "text": "\n".join(text_lines),
+        },
+        timeout=15
+    )
+
+####################################################
 #--- Configuration des taches Celery ---
 ####################################################
 
 @celery.task(bind=True, max_retries=3)
-def send_fax_task(self, file_path, file_name, to_number, from_number, connection_id):
+def send_fax_task(self, file_path, file_name, to_number, from_number, connection_id, notify_email=None):
     try:
         s3_key = upload_to_s3(file_path, file_name)
         presigned_url = generate_presigned_url(s3_key)
@@ -199,9 +257,27 @@ def send_fax_task(self, file_path, file_name, to_number, from_number, connection
             raise Exception("Fax failed")
         logger.info(f"Sent fax with fax_id: {fax_id}")
         set_fax_file(fax_id, file_path)
+
+        if notify_email:
+            try:
+                set_fax_meta(
+                    fax_id,
+                    {
+                        "notify_email": notify_email,
+                        "to_number": to_number,
+                        "from_number": from_number,
+                        "file_name": file_name
+                    }
+                )
+                logger.debug("Stored fax meta for notification. fax_id=%s notify_email=%s", fax_id, notify_email)
+            except Exception:
+                logger.warning("Failed to store fax meta for fax_id=%s", fax_id, exc_info=True)
+
         return fax_id
     except Exception as exc:
-        logger.warning(f"Fax send failed, retrying in 5 minutes: {exc}")
+        logger.warning("Fax send failed; retrying in 5 minutes (attempt %s/%s). Error: %s",
+                       self.request.retries + 1, self.max_retries, exc, exc_info=True)
+        raise self.retry(exc=exc, countdown=300)
 
 @celery.task(bind=True, max_retries=3)
 def send_email_task(self, attachment, from_number, to_number, email):
@@ -220,6 +296,30 @@ def send_email_task(self, attachment, from_number, to_number, email):
         logger.error("Error sending email", exc_info=True)
         raise self.retry(exc=exc, countdown=300)
 
+@celery.task(bind=True, max_retries=3)
+def send_delivery_notification_task(self, notify_email, fax_id, to_number, from_number, file_name=None):
+    try:
+        resp = send_delivery_notification_email(
+            notify_email=notify_email,
+            fax_id=fax_id,
+            to_number=to_number,
+            from_number=from_number,
+            file_name=file_name
+        )
+
+        if resp.status_code == 200:
+            try:
+                logger.info("Delivery notification email sent: %s", resp.json().get("id"))
+            except Exception:
+                logger.info("Delivery notification email sent (non-JSON response).")
+            return True
+
+        logger.error("Mailgun delivery notification failed (%s): %s", resp.status_code, resp.text)
+        raise Exception(f"Mailgun returned {resp.status_code}")
+    except Exception as exc:
+        logger.error("Error sending delivery notification email", exc_info=True)
+        raise self.retry(exc=exc, countdown=300)
+
 @celery.task
 def delete_from_s3_task(file_name):
     bucket = get_bucket_name()
@@ -229,7 +329,7 @@ def delete_from_s3_task(file_name):
     except Exception as e:
         logger.warning(f"Failed to delete {file_name} from S3: {e}")
 
-#################################################### 
+####################################################
 #--- Routes d'application ---
 ####################################################
 
@@ -247,7 +347,6 @@ def inbound_message():
         to_number = body["data"]["payload"]["to"]
         from_number = body["data"]["payload"]["from"]
         media_url = body["data"]["payload"]["media_url"]
-        # Download the fax file
         attachment = download_file(media_url)
         set_fax_file(fax_id, attachment)
         email = get_email_from_phone_number(to_number)
@@ -260,11 +359,30 @@ def inbound_message():
         except Exception as e:
             logger.error("Error queuing email sending task", exc_info=True)
 
-
-    # Gestion des evenements "fax.delivered" de la part de Telnyx
     elif event_type in ("fax.delivered", "fax.email.delivered"):
+        if direction == "outbound":
+            meta = get_fax_meta(fax_id)
+            if meta and meta.get("notify_email"):
+                if mark_fax_notified_once(fax_id):
+                    try:
+                        send_delivery_notification_task.delay(
+                            notify_email=meta.get("notify_email"),
+                            fax_id=fax_id,
+                            to_number=meta.get("to_number"),
+                            from_number=meta.get("from_number"),
+                            file_name=meta.get("file_name")
+                        )
+                        logger.info("Queued delivery notification email for outbound fax_id: %s", fax_id)
+                    except Exception:
+                        logger.error("Error queuing delivery notification email", exc_info=True)
+                else:
+                    logger.debug("Delivery notification already sent for fax_id: %s", fax_id)
+
+            delete_fax_meta(fax_id)
+
         file_path = get_fax_file(fax_id)
         delete_fax_file(fax_id)
+
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
@@ -275,7 +393,10 @@ def inbound_message():
                 logger.warning(f"Failed to delete file {file_path}: {cleanup_error}")
         else:
             logger.debug(f"No file found for fax_id {fax_id} during cleanup")
+
         return Response(status=200)
+
+    logger.debug(f"Ignoring unhandled fax event_type: {event_type}, direction: {direction}, fax_id: {fax_id}")
     return Response(status=200)
 
 
@@ -326,7 +447,8 @@ def inbound_email():
                 file_name=filename,
                 to_number=to_phone_number,
                 from_number=from_phone_number,
-                connection_id=connection_id
+                connection_id=connection_id,
+                notify_email=from_email
             )
             logger.info(f"Queued outbound fax task for {filename}, Celery task id: {result.id}")
             processed = True
@@ -343,7 +465,7 @@ def inbound_email():
 def respond_to_tests():
     return Response(status=200)
 
-#################################################### 
+####################################################
 #--- Application ---
 ####################################################
 
