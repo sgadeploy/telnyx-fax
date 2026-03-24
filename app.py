@@ -163,7 +163,7 @@ def upload_to_s3(file_path: str, file_name: str) -> str:
     bucket = get_bucket_name()
     logger.debug(f"Uploading {file_path} to bucket {bucket} as {file_name}")
     try:
-        get_s3_client().upload_file(file_path, bucket, file_name)
+        get_s3_client().upload_file(file_path, bucket, file_name, ExtraArgs={"ContentType": "application/pdf"})
     except NoCredentialsError:
         logger.error("AWS credentials not found. Set env vars or attach an IAM role.")
         raise
@@ -173,7 +173,7 @@ def upload_to_s3(file_path: str, file_name: str) -> str:
 def generate_presigned_url(file_name: str, expiration: int = 3600) -> str:
     url = get_s3_client().generate_presigned_url(
         "get_object",
-        Params={"Bucket": get_bucket_name(), "Key": file_name},
+        Params={"Bucket": get_bucket_name(), "Key": file_name, "ResponseContentType": "application/pdf"},
         ExpiresIn=expiration,
     )
     logger.debug(f"Generated pre-signed URL: {url}")
@@ -385,7 +385,7 @@ def inbound_message():
                 os.remove(file_path)
                 logger.debug(f"Deleted delivered fax file: {file_path}")
                 file_name = os.path.basename(file_path)
-                delete_from_s3_task.delay(file_name)
+                # delete_from_s3_task.delay(file_name)  # Temporarily disabled for S3 URL debugging
             except Exception as cleanup_error:
                 logger.warning(f"Failed to delete file {file_path}: {cleanup_error}")
         else:
