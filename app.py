@@ -385,7 +385,7 @@ def inbound_message():
                 os.remove(file_path)
                 logger.debug(f"Deleted delivered fax file: {file_path}")
                 file_name = os.path.basename(file_path)
-                # delete_from_s3_task.delay(file_name)  # Temporarily disabled for S3 URL debugging
+                delete_from_s3_task.delay(file_name)
             except Exception as cleanup_error:
                 logger.warning(f"Failed to delete file {file_path}: {cleanup_error}")
         else:
